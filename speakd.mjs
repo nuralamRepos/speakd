@@ -248,11 +248,11 @@ export async function findPlayer() {
   return null;
 }
 
-export async function synthesize(text, signal) {
+export async function synthesize(text, signal, profile = null) {
   if (cfg.provider === "beep") return { mime: "audio/none", base64: "" };
   if (cfg.provider === "gemini") return await synthGemini(text, signal);
   if (cfg.provider === "openai") return await synthOpenai(text, signal);
-  if (cfg.provider === "command") return await synthCommand(text, signal);
+  if (cfg.provider === "command") return await synthCommand(text, signal, profile);
   throw new Error(`unknown provider: ${cfg.provider}`);
 }
 
@@ -292,9 +292,24 @@ async function synthOpenai(text, signal) {
   return { mime: cfg.format === "wav" ? "audio/wav" : "audio/mpeg", base64: buf.toString("base64") };
 }
 
-async function synthCommand(text, signal) {
+async function synthCommand(text, signal, profile = null) {
   if (!cfg.command) throw new Error("SPEAKD_COMMAND not set");
-  const args = cfg.args.map((a) => a.replace("{text}", text));
+  // Per-client voice profile (piper): swap in its model + pacing, and emit
+  // real WAV to stdout (-f -) instead of headerless raw PCM — the buffered
+  // path writes a file, and a headerless file plays at the wrong speed.
+  let args;
+  if (profile) {
+    args = ["-m", profile.model, "-f", "-", "--length-scale", String(profile.lengthScale ?? 1.45), "--sentence-silence", "0.35"];
+  } else {
+    args = cfg.args.map((a) => a.replace("{text}", text));
+    // Replace raw-PCM output with WAV-on-stdout so the file has a header.
+    const rawIdx = args.indexOf("--output-raw");
+    if (rawIdx !== -1) {
+      args[rawIdx] = "-f";
+      args.splice(rawIdx + 1, 0, "-");
+    }
+  }
+  const isWav = profile !== null || args.includes("-f");
   return await new Promise((resolve, reject) => {
     const child = spawn(cfg.command, args, { signal, stdio: ["pipe", "pipe", "pipe"] });
     const chunks = [];
@@ -310,8 +325,12 @@ async function synthCommand(text, signal) {
     child.on("close", (code) => {
       if (signal?.aborted) return reject(new Error("aborted"));
       if (code !== 0) return reject(new Error(`${cfg.command} exited ${code}${err ? `: ${err.trim()}` : ""}`));
-      const mime = cfg.mime === "audio/pcm" ? "audio/pcm" : cfg.mime;
-      resolve({ mime, base64: Buffer.concat(chunks).toString("base64"), pcmRate: cfg.pcmRate });
+      if (isWav) {
+        resolve({ mime: "audio/wav", base64: Buffer.concat(chunks).toString("base64"), pcmRate: cfg.pcmRate });
+      } else {
+        const mime = cfg.mime === "audio/pcm" ? "audio/pcm" : cfg.mime;
+        resolve({ mime, base64: Buffer.concat(chunks).toString("base64"), pcmRate: cfg.pcmRate });
+      }
     });
     child.stdin.on("error", () => {});
     child.stdin.end(text);
@@ -518,12 +537,13 @@ async function drain() {
       current = { ...job, since: Date.now(), cancelled: false };
       emit("started", { id: job.id, client: job.client, via: job.via, voice: job.voice?.id, chars: job.chars });
       try {
-        let played = false;
-        if (cfg.provider === "command" && cfg.playback === "host") {
-          played = await streamCommandToPlayer(undefined, job.voice ?? null, current);
-        }
-        if (!played && !current.cancelled) {
-          const audio = await synthesize(job.text, undefined);
+        // Always the buffered path: synthesize to memory, then play a real
+        // file. (The stdin-pipe streaming path silently played nothing on
+        // this machine's pw-play — it exits 0 on raw stdin it cannot parse.
+        // Buffered audio for a 450-char message is only ~600 KB; audibility
+        // beats that.)
+        if (!current.cancelled) {
+          const audio = await synthesize(job.text, undefined, job.voice ?? null);
           if (!current.cancelled && audio.mime !== "audio/none" && cfg.playback === "host") await playOnHost(audio, undefined, current);
         }
         if (current.cancelled) {
