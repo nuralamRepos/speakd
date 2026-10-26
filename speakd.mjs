@@ -35,13 +35,14 @@ import { createInterface } from "node:readline";
 process.on("unhandledRejection", (e) => console.error(`speakd: unhandled rejection: ${e?.message ?? e}`));
 
 //#region config
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const BOOT = Date.now();
 const cfg = {
   port: Number(process.env.SPEAKD_PORT ?? 8777),
   host: process.env.SPEAKD_HOST ?? "127.0.0.1", // loopback only, never exposed
   provider: process.env.SPEAKD_PROVIDER ?? "beep",
   announce: (process.env.SPEAKD_ANNOUNCE ?? "on") === "on", // prefix caller name when known
+  preset: process.env.SPEAKD_PRESET ?? "assistant", // default preset for clients without their own
   apiKey: process.env.SPEAKD_API_KEY ?? "",
   apiKeyEnv: process.env.SPEAKD_API_KEY_ENV ?? (process.env.SPEAKD_PROVIDER === "openai" ? "OPENAI_API_KEY" : "GEMINI_API_KEY"),
   model: process.env.SPEAKD_MODEL || undefined,
@@ -158,6 +159,113 @@ function knownVoiceIds() {
   const pool = Array.isArray(voiceState.pool) ? voiceState.pool : null;
   if (!pool) return [];
   return pool.filter((p) => typeof p?.model === "string").map((p) => p.id).filter(Boolean);
+}
+//#endregion
+
+//#region speech protocol — the binding contract every harness follows
+/**
+ * One versioned contract, served at GET /protocol and as an MCP tool, so
+ * every harness speaks the same way without per-agent configuration. The
+ * gateway enforces it mechanically: strict presets REJECT violations with
+ * 422 + fix hint (the agent retries compliant), lenient presets clamp.
+ */
+const PROTOCOL = {
+  protocol: "speakd-speech",
+  version: "1.0.0",
+  compatibility: "1.x: additive changes only — classes/presets may gain fields; removals or renumbering require a major version.",
+  binding:
+    "All harnesses that connect to speakd are bound to this contract. The gateway enforces it mechanically: in strict mode a non-compliant call is REJECTED with 422 {violation, rule, actual, candidate, hint} — the candidate is the auto-fixed text, so retrying is just echoing it; in lenient mode violations are clamped silently.",
+  sessionRules: [
+    { rule: "Call user_context once before your first speak call.", enforcedBy: "convention" },
+    { rule: "Connect through your identity door (/mcp/<your-name> or /speak/<your-name>) so voice + announcement work.", enforcedBy: "gateway — names the voice; the door proves the route, not the caller (loopback names are spoofable)" },
+    { rule: "One idea per call; never fire multiple speak calls back-to-back.", enforcedBy: "convention — the gateway softens bursts with a queue gap" },
+  ],
+  classes: {
+    summary: {
+      default: true,
+      maxSentences: 3,
+      maxChars: 240,
+      tone: "conversational",
+      forbidden: ["code", "urls", "tables", "filePaths", "stepLists"],
+      purpose: "The spoken headline of your written reply. Full detail stays in text. Note: code/URLs/tables are auto-stripped by the cleaner, never a violation.",
+    },
+    alert: { maxChars: 200, tone: "urgent but calm", purpose: "Needs attention now: task done/failed, battery, waiting-for-input." },
+    ping: { maxChars: 80, purpose: "Presence: greeting, confirm, hand-off. One short sentence." },
+    raw: { maxChars: 450, cleaner: "off", purpose: "Exact words required. Use sparingly; everything else gets cleaned." },
+  },
+  truncation: "When both caps bind, the shorter cut wins, at a sentence boundary.",
+  presets: {
+    assistant: { desc: "friendly default", enforcement: "lenient", announce: true },
+    jarvis: { desc: "concise, formal, proactive tone (strict: violations bounce with a copy-paste fix)", enforcement: "strict", announce: true },
+    minimal: { desc: "announcements off, fewest words (strict)", enforcement: "strict", announce: false, classes: ["summary", "alert"] },
+    accessibility: { desc: "slower and longer for careful listening", enforcement: "lenient", announce: true, pacing: 1.6, capBonus: 120 },
+  },
+  enforcement: {
+    onViolation: "422 {violation, rule, actual, candidate, hint} — correct and retry (echo candidate for a copy-paste fix)",
+    abuseGuard: "Repeated rejected calls cool down per client (429) so one looping agent cannot starve the queue.",
+  },
+};
+
+/** Explicit per-client preset config (set via POST /protocol/select). Per-call params override. */
+const clientPresets = new Map(); // lower-cased client → preset name
+
+/** Rejection cooldown: clients looping on 422s get 429 instead of churning the queue. */
+const REJECT_WINDOW_MS = 15000;
+const REJECT_MAX = 6;
+const rejectLog = new Map(); // client → [timestamps]
+function rejectCooldown(clientName) {
+  if (!clientName) return false;
+  const key = String(clientName).toLowerCase();
+  const now = Date.now();
+  const arr = (rejectLog.get(key) ?? []).filter((t) => now - t < REJECT_WINDOW_MS);
+  arr.push(now);
+  rejectLog.set(key, arr.length > REJECT_MAX ? arr.slice(-REJECT_MAX) : arr);
+  return arr.length > REJECT_MAX;
+}
+function clearRejects(clientName) {
+  if (clientName) rejectLog.delete(String(clientName).toLowerCase());
+}
+
+function presetFor(clientName, explicit) {
+  const key = clientName ? String(clientName).toLowerCase() : null;
+  const name = explicit ?? (key && clientPresets.get(key)) ?? cfg.preset;
+  return { name, ...(PROTOCOL.presets[name] ?? PROTOCOL.presets.assistant) };
+}
+
+const countSentences = (s) => (s.match(/[.!?]+(\s|$)/g) ?? []).length + (s && !/[.!?]\s*$/.test(s) ? 1 : 0);
+
+/** Clamp text to the class caps: shorter cut wins, at a sentence boundary. */
+function clampToClass(text, cls, bonus = 0) {
+  const cap = (cls.maxChars ?? PROTOCOL.classes.summary.maxChars) + bonus;
+  let out = text;
+  const cutAt = (n) => {
+    const cut = out.slice(0, n);
+    const stop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
+    return stop > n * 0.4 ? cut.slice(0, stop + 1) : cut;
+  };
+  if (out.length > cap) out = cutAt(cap);
+  if (cls.maxSentences && countSentences(out) > cls.maxSentences) {
+    const ends = [...out.matchAll(/[.!?]+(\s|$)/g)].map((m) => m.index + m[0].length);
+    const limit = ends[Math.min(cls.maxSentences, ends.length) - 1];
+    if (limit) out = out.slice(0, limit);
+  }
+  return out.trim();
+}
+
+/** Validate the length/sentence caps. Returns null, or the 422 body (with copy-paste candidate). */
+function protocolViolation(text, clsName, cls, preset) {
+  const cap = (cls.maxChars ?? PROTOCOL.classes.summary.maxChars) + (preset.capBonus ?? 0);
+  const sentences = countSentences(text);
+  const tooLong = text.length > cap;
+  const tooMany = cls.maxSentences && sentences > cls.maxSentences;
+  if (!tooLong && !tooMany) return null;
+  return {
+    violation: tooLong ? "tooLong" : "tooManySentences",
+    rule: `${clsName}: max ${cap} chars${cls.maxSentences ? ` / ${cls.maxSentences} sentences` : ""} (shorter cut wins, sentence boundary)`,
+    actual: tooLong ? `${text.length} chars` : `${sentences} sentences`,
+    candidate: clampToClass(text, cls, preset.capBonus ?? 0),
+    hint: "echo the candidate text to retry compliant, or shorten your summary yourself",
+  };
 }
 //#endregion
 
@@ -619,14 +727,22 @@ const MCP_TOOLS = [
   {
     name: "speak",
     description:
-      "Speak a SHORT human summary aloud on this machine's speakers. SPEECH PROTOCOL: 1-4 spoken sentences, max ~2-3 sentences per call; conversational tone; no code, no URLs, no tables, no file paths, no step-by-step lists; numbers and names only when essential. The full technical response goes in the written reply. Code blocks, links and tables are stripped automatically. Use for short summaries, not raw code.",
+      "Speak a SHORT human summary aloud on this machine's speakers. SPEECH PROTOCOL (binding, see the protocol tool): summary class = max 3 sentences / 240 chars, conversational, no code, no URLs, no tables, no file paths, no step lists — the full technical response goes in the written reply; this voice is the headline. Code/URLs/tables are stripped automatically. Optional: class (summary|alert|ping|raw), protocol preset (assistant|jarvis|minimal|accessibility).",
     inputSchema: {
       type: "object",
       properties: {
-        text: { type: "string", description: "Short spoken summary: 1-4 conversational sentences. No code, no URLs, no lists." },
+        text: { type: "string", description: "Spoken headline: max 3 short conversational sentences (~240 chars). No code, no URLs, no lists." },
+        class: { type: "string", enum: ["summary", "alert", "ping", "raw"], description: "speech class; default summary" },
+        protocol: { type: "string", enum: ["assistant", "jarvis", "minimal", "accessibility"], description: "preset for this call; default assistant" },
       },
       required: ["text"],
     },
+  },
+  {
+    name: "protocol",
+    description:
+      "The binding speech contract for this gateway: classes, caps, presets, and enforcement. Read once per session if you want to speak compliantly by construction. Does not speak.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "status",
@@ -703,12 +819,25 @@ async function handleRpc(msg, respond, clientName) {
       respond({ jsonrpc: "2.0", id, result: { tools: MCP_TOOLS } });
     } else if (method === "tools/call" && params?.name === "speak") {
       const raw = String(params.arguments?.text ?? "");
-      const text = speakableText(raw);
-      if (text.length < 2) throw new Error("nothing speakable in the text");
-      const spoken = clientName && cfg.announce ? `${clientName} here. ${text}` : text;
-      const voice = resolveVoice(clientName); // harness door: may claim a free voice
-      const { id: qid, depth } = enqueue(spoken, { via: "mcp", client: clientName, voice });
-      respond({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Speaking ${spoken.length} chars (queue depth ${depth}, job ${qid}).` }] } });
+      const opts = { class: params.arguments?.class, protocol: params.arguments?.protocol };
+      const r = speakViaHttp(raw, clientName, "mcp", undefined, opts);
+      if (r.error) {
+        const parts = [r.error];
+        if (r.violation) {
+          parts.push(`violation=${r.violation.violation}`, `rule=${r.violation.rule}`, `actual=${r.violation.actual}`);
+          if (r.violation.candidate) parts.push(`compliant text to use instead: ${r.violation.candidate}`);
+          if (r.violation.hint) parts.push(r.violation.hint);
+        }
+        respond({
+          jsonrpc: "2.0",
+          id,
+          error: { code: r.status === 429 ? -32001 : -32000, message: parts.join(" | ").slice(0, 800) },
+        });
+        return;
+      }
+      respond({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Speaking ${r.chars} chars (queue depth ${r.depth}, job ${r.id}, class ${r.class}, preset ${r.preset}/${r.enforcement}).` }] } });
+    } else if (method === "tools/call" && params?.name === "protocol") {
+      respond({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ ...PROTOCOL, serverDefault: cfg.preset }) }] } });
     } else if (method === "tools/call" && params?.name === "status") {
       const verbose = params.arguments?.verbose === true;
       const body = verbose ? statusSnapshot() : mcpStatusCompact();
@@ -775,14 +904,50 @@ async function readBody(req, res) {
  * transports. `voiceOverride` comes only from the manual /speak form and
  * never triggers assignment or persistence.
  */
-function speakViaHttp(text, clientName, via, voiceOverride) {
-  const cleaned = speakableText(text);
+/**
+ * Queue one cleaned utterance, honoring the speech protocol. All params are
+ * per-call and side-effect-free (no sticky mutation): class, protocol
+ * (explicit preset for THIS call), pacing, clean. Validation happens before
+ * enqueue so a 422 never consumes a queue slot or starts the burst gap.
+ */
+function speakViaHttp(text, clientName, via, voiceOverride, opts = {}) {
+  // Rejection cooldown: a 422-looping client gets 429 instead of churning the queue.
+  if (clientName && rejectCooldown(clientName)) {
+    return { error: "too many rejected calls — cool down and send a compliant summary", status: 429 };
+  }
+  const preset = presetFor(clientName, opts.protocol);
+  if (opts.protocol && !PROTOCOL.presets[opts.protocol]) {
+    return { error: "speech protocol violation", status: 422, violation: { violation: "unknownPreset", rule: `preset must be one of ${Object.keys(PROTOCOL.presets).join(", ")}`, actual: String(opts.protocol), hint: "retry with a valid preset or omit it" } };
+  }
+  if (preset.classes && !preset.classes.includes(opts.class ?? "summary")) {
+    return { error: "speech protocol violation", status: 422, violation: { violation: "classNotAllowed", rule: `${preset.name} preset allows only: ${preset.classes.join(", ")}`, actual: String(opts.class ?? "summary"), hint: `retry with class ${preset.classes.join(" or ")}` } };
+  }
+  const clsName = opts.class && PROTOCOL.classes[opts.class] ? opts.class : "summary";
+  const cls = PROTOCOL.classes[clsName];
+  // Cleaner-strippable content is auto-fixed, never a violation; only the
+  // caps can violate. raw class opts out of the cleaner.
+  let cleaned = opts.clean === false || cls.cleaner === "off" ? String(text ?? "").replace(/\s+/g, " ").trim() : speakableText(text);
   if (cleaned.length < 2) return { error: "nothing speakable", status: 422 };
-  const announce = clientName && cfg.announce;
+
+  const violation = protocolViolation(cleaned, clsName, cls, preset);
+  if (violation && preset.enforcement === "strict") {
+    return { error: "speech protocol violation", status: 422, violation };
+  }
+  // lenient: clamp at the class caps (shorter cut wins, sentence boundary)
+  cleaned = clampToClass(cleaned, cls, preset.capBonus ?? 0);
+  if (cleaned.length < 2) return { error: "nothing speakable", status: 422 };
+
+  const announce = clientName && cfg.announce && preset.announce !== false;
   const spoken = announce ? `${clientName} here. ${cleaned}` : cleaned;
-  const voice = voiceOverride !== undefined ? voiceOverride : resolveVoice(clientName);
+  let voice = voiceOverride !== undefined ? voiceOverride : resolveVoice(clientName);
+  const pacing = opts.pacing ?? preset.pacing;
+  if (voice && pacing) voice = { ...voice, lengthScale: Number(pacing) };
+  else if (!voice && pacing && cfg.provider === "command" && cfg.command) {
+    voice = { id: "default", model: null, lengthScale: Number(pacing) }; // service args carry the model
+  }
   const { id, depth, dropped } = enqueue(spoken, { via, client: clientName, voice });
-  return { id, depth, dropped, chars: spoken.length };
+  clearRejects(clientName); // success resets the cooldown window
+  return { id, depth, dropped, chars: spoken.length, class: clsName, preset: preset.name, enforcement: preset.enforcement };
 }
 
 async function runHttp() {
@@ -805,6 +970,27 @@ async function runHttp() {
       }
       if (req.method === "GET" && url.pathname === "/status") {
         json(res, 200, statusSnapshot());
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/protocol") {
+        json(res, 200, { ok: true, ...PROTOCOL, clientDefaults: Object.fromEntries(clientPresets), serverDefault: cfg.preset });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/protocol/select") {
+        // Persist a per-client default preset (per-call ?protocol= overrides this).
+        const body = await readBody(req, res);
+        if (body === null || body === undefined) return;
+        const client = String(body.client ?? "").toLowerCase();
+        if (!client) {
+          json(res, 400, { ok: false, error: "client name required" });
+          return;
+        }
+        if (!body.preset || !PROTOCOL.presets[body.preset]) {
+          json(res, 400, { ok: false, error: `unknown preset`, presets: Object.keys(PROTOCOL.presets) });
+          return;
+        }
+        clientPresets.set(client, body.preset);
+        json(res, 200, { ok: true, client, preset: body.preset, enforcement: PROTOCOL.presets[body.preset].enforcement });
         return;
       }
       if (req.method === "POST" && url.pathname === "/stop") {
@@ -841,6 +1027,7 @@ async function runHttp() {
         if (url.pathname === "/speak") {
           // Manual form: persona ("as") or forced voice ("voice") — strict,
           // side-effect-free, never assigns or persists a pool voice.
+          const manualOpts = { class: body.class, protocol: body.protocol, pacing: body.pacing, clean: body.clean };
           const wantsAs = body.as !== undefined;
           const wantsVoice = body.voice !== undefined;
           if (wantsAs && wantsVoice) {
@@ -858,8 +1045,8 @@ async function runHttp() {
               json(res, 400, { ok: false, error: `client "${body.as}" has no voice assigned yet` });
               return;
             }
-            const r = speakViaHttp(text, key, "manual", v);
-            if (r.error) json(res, r.status, { ok: false, error: r.error });
+            const r = speakViaHttp(text, key, "manual", v, manualOpts);
+            if (r.error) json(res, r.status, r.violation ? { ok: false, error: r.error, ...r.violation } : { ok: false, error: r.error });
             else json(res, 202, { ok: true, queued: true, ...r });
             return;
           }
@@ -872,20 +1059,21 @@ async function runHttp() {
               return;
             }
             const v = { id: entry.id, model: expandPath(entry.model), lengthScale: Number(entry.lengthScale ?? 1.45) };
-            const r = speakViaHttp(text, undefined, "manual", v);
-            if (r.error) json(res, r.status, { ok: false, error: r.error });
+            const r = speakViaHttp(text, undefined, "manual", v, manualOpts);
+            if (r.error) json(res, r.status, r.violation ? { ok: false, error: r.error, ...r.violation } : { ok: false, error: r.error });
             else json(res, 202, { ok: true, queued: true, ...r });
             return;
           }
-          const r = speakViaHttp(text, undefined, "manual", null);
-          if (r.error) json(res, r.status, { ok: false, error: r.error });
+          const r = speakViaHttp(text, undefined, "manual", null, manualOpts);
+          if (r.error) json(res, r.status, r.violation ? { ok: false, error: r.error, ...r.violation } : { ok: false, error: r.error });
           else json(res, 202, { ok: true, queued: true, ...r });
           return;
         }
         // Harness door: /speak/<client> — auto voice assignment allowed.
         const clientName = pathClient("/speak/");
-        const r = speakViaHttp(text, clientName, "http", undefined);
-        if (r.error) json(res, r.status, { ok: false, error: r.error });
+        const opts = { class: body.class, protocol: body.protocol, pacing: body.pacing, clean: body.clean };
+        const r = speakViaHttp(text, clientName, "http", undefined, opts);
+        if (r.error) json(res, r.status, r.violation ? { ok: false, error: r.error, ...r.violation } : { ok: false, error: r.error });
         else json(res, 202, { ok: true, queued: true, ...r });
         return;
       }
