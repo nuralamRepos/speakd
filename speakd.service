@@ -3,7 +3,7 @@ Description=speakd — universal speak gateway for CLI agents
 After=graphical-session.target
 
 [Service]
-ExecStart=/usr/bin/node %h/speak-gateway/speakd.mjs
+ExecStart=/usr/bin/node /media/nuralam9922/DevDrive/software-tools/speakd/speakd.mjs
 # To use a real voice later, set provider and key, e.g.:
 #   Environment=SPEAKD_PROVIDER=gemini
 #   Environment=GEMINI_API_KEY=your-key

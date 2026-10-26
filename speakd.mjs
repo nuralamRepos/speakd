@@ -209,6 +209,73 @@ const PROTOCOL = {
 /** Explicit per-client preset config (set via POST /protocol/select). Per-call params override. */
 const clientPresets = new Map(); // lower-cased client → preset name
 
+/**
+ * Per-client config freedom: each harness tunes its own defaults via
+ * POST /config {"client", "voice"?, "preset"?, "pacing"?, "maxChars"?} and
+ * reads them back at GET /config?client=deepy. Stored on its pool entry in
+ * voices.json (persisted), applied whenever the harness does not override
+ * per call. Same client + same call params always win; this only sets the
+ * harness's own standing defaults.
+ */
+function setClientConfig(clientName, patch = {}) {
+  const key = String(clientName ?? "").toLowerCase();
+  if (!key) return { error: "client name required" };
+  const pool = Array.isArray(voiceState.pool) ? voiceState.pool : null;
+  if (!pool) return { error: "voice pool disabled — config needs pool mode" };
+  let entry = pool.find((p) => p.clients?.includes(key));
+  if (!entry) {
+    // Claim a voice now so config has a home (same policy as first speak).
+    const resolved = resolveVoice(key, { allowAssign: true });
+    entry = pool.find((p) => p.clients?.includes(key));
+    if (!entry || !resolved) return { error: `no free voice for "${key}"`, voices: pool.map((p) => p.id) };
+  }
+  entry.config = entry.config ?? {};
+  const applied = {};
+  if (patch.voice !== undefined) {
+    const vid = String(patch.voice).toLowerCase();
+    const target = pool.find((p) => String(p.id ?? "").toLowerCase() === vid && typeof p.model === "string");
+    if (!target) return { error: `unknown voice id "${patch.voice}"`, voices: pool.map((p) => p.id) };
+    entry.clients = entry.clients.filter((c) => c !== key);
+    target.clients = [...(target.clients ?? []), key];
+    target.config = { ...(target.config ?? {}), preset: entry.config.preset, pacing: entry.config.pacing, maxChars: entry.config.maxChars };
+    applied.voice = target.id;
+  }
+  const entryNow = pool.find((p) => p.clients?.includes(key));
+  if (patch.preset !== undefined) {
+    if (!PROTOCOL.presets[patch.preset]) return { error: `unknown preset`, presets: Object.keys(PROTOCOL.presets) };
+    entryNow.config = { ...(entryNow.config ?? {}), preset: String(patch.preset) };
+    applied.preset = entryNow.config.preset;
+  }
+  if (patch.pacing !== undefined) {
+    const n = Number(patch.pacing);
+    if (!Number.isFinite(n) || n < 0.8 || n > 2.5) return { error: "pacing must be 0.8–2.5" };
+    entryNow.config = { ...(entryNow.config ?? {}), pacing: n };
+    applied.pacing = n;
+  }
+  if (patch.maxChars !== undefined) {
+    const n = Number(patch.maxChars);
+    if (!Number.isFinite(n) || n < 40 || n > 1200) return { error: "maxChars must be 40–1200" };
+    entryNow.config = { ...(entryNow.config ?? {}), maxChars: n };
+    applied.maxChars = n;
+  }
+  persistVoiceStateSoon();
+  return { ok: true, client: key, applied };
+}
+
+function getClientConfig(clientName) {
+  const key = String(clientName ?? "").toLowerCase();
+  const pool = Array.isArray(voiceState.pool) ? voiceState.pool : null;
+  const entry = pool?.find((p) => p.clients?.includes(key));
+  const c = entry?.config ?? {};
+  return {
+    client: key || null,
+    voice: entry?.id ?? null,
+    preset: c.preset ?? clientPresets.get(key) ?? cfg.preset,
+    pacing: c.pacing ?? null,
+    maxChars: c.maxChars ?? null,
+  };
+}
+
 /** Rejection cooldown: clients looping on 422s get 429 instead of churning the queue. */
 const REJECT_WINDOW_MS = 15000;
 const REJECT_MAX = 6;
@@ -915,7 +982,9 @@ function speakViaHttp(text, clientName, via, voiceOverride, opts = {}) {
   if (clientName && rejectCooldown(clientName)) {
     return { error: "too many rejected calls — cool down and send a compliant summary", status: 429 };
   }
-  const preset = presetFor(clientName, opts.protocol);
+  // Harness's own stored defaults (POST /config) apply when not overridden per call.
+  const cc = getClientConfig(clientName);
+  const preset = presetFor(clientName, opts.protocol ?? cc.preset);
   if (opts.protocol && !PROTOCOL.presets[opts.protocol]) {
     return { error: "speech protocol violation", status: 422, violation: { violation: "unknownPreset", rule: `preset must be one of ${Object.keys(PROTOCOL.presets).join(", ")}`, actual: String(opts.protocol), hint: "retry with a valid preset or omit it" } };
   }
@@ -923,7 +992,8 @@ function speakViaHttp(text, clientName, via, voiceOverride, opts = {}) {
     return { error: "speech protocol violation", status: 422, violation: { violation: "classNotAllowed", rule: `${preset.name} preset allows only: ${preset.classes.join(", ")}`, actual: String(opts.class ?? "summary"), hint: `retry with class ${preset.classes.join(" or ")}` } };
   }
   const clsName = opts.class && PROTOCOL.classes[opts.class] ? opts.class : "summary";
-  const cls = PROTOCOL.classes[clsName];
+  const cls = { ...PROTOCOL.classes[clsName] };
+  if (cc.maxChars) cls.maxChars = Math.min(cls.maxChars ?? cc.maxChars, cc.maxChars); // harness-tightened cap
   // Cleaner-strippable content is auto-fixed, never a violation; only the
   // caps can violate. raw class opts out of the cleaner.
   let cleaned = opts.clean === false || cls.cleaner === "off" ? String(text ?? "").replace(/\s+/g, " ").trim() : speakableText(text);
@@ -940,7 +1010,7 @@ function speakViaHttp(text, clientName, via, voiceOverride, opts = {}) {
   const announce = clientName && cfg.announce && preset.announce !== false;
   const spoken = announce ? `${clientName} here. ${cleaned}` : cleaned;
   let voice = voiceOverride !== undefined ? voiceOverride : resolveVoice(clientName);
-  const pacing = opts.pacing ?? preset.pacing;
+  const pacing = opts.pacing ?? cc.pacing ?? preset.pacing;
   if (voice && pacing) voice = { ...voice, lengthScale: Number(pacing) };
   else if (!voice && pacing && cfg.provider === "command" && cfg.command) {
     voice = { id: "default", model: null, lengthScale: Number(pacing) }; // service args carry the model
@@ -974,6 +1044,19 @@ async function runHttp() {
       }
       if (req.method === "GET" && url.pathname === "/protocol") {
         json(res, 200, { ok: true, ...PROTOCOL, clientDefaults: Object.fromEntries(clientPresets), serverDefault: cfg.preset });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/config") {
+        json(res, 200, { ok: true, ...getClientConfig(url.searchParams.get("client")), voices: knownVoiceIds(), presets: Object.keys(PROTOCOL.presets) });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/config") {
+        // Harness config freedom: standing per-client defaults, persisted.
+        const body = await readBody(req, res);
+        if (body === null || body === undefined) return;
+        const r = setClientConfig(body.client, body);
+        if (r.error) json(res, 400, { ok: false, ...r });
+        else json(res, 200, r);
         return;
       }
       if (req.method === "POST" && url.pathname === "/protocol/select") {
