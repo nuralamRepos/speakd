@@ -1,0 +1,19 @@
+[Unit]
+Description=speakd — universal speak gateway for CLI agents
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/node %h/speak-gateway/speakd.mjs
+# To use a real voice later, set provider and key, e.g.:
+#   Environment=SPEAKD_PROVIDER=gemini
+#   Environment=GEMINI_API_KEY=your-key
+Environment=SPEAKD_PROVIDER=command
+Restart=on-failure
+Environment=SPEAKD_COMMAND=%h/.local/bin/piper
+Environment="SPEAKD_ARGS=[\"-m\",\"%h/.cache/piper-test/voice.onnx\",\"--output-raw\",\"--length-scale\",\"1.15\",\"--sentence-silence\",\"0.35\"]"
+Environment=SPEAKD_MIME=audio/pcm
+Environment=SPEAKD_PCM_RATE=22050
+RestartSec=3
+
+[Install]
+WantedBy=default.target
