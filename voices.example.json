@@ -1,0 +1,32 @@
+{
+  "pool": [
+    {
+      "id": "in-accent",
+      "model": "~/.cache/piper-test/voice-in.onnx",
+      "lengthScale": 1.45,
+      "usage": 0,
+      "clients": []
+    },
+    {
+      "id": "us-female",
+      "model": "~/.cache/piper-test/voice.onnx",
+      "lengthScale": 1.45,
+      "usage": 0,
+      "clients": []
+    },
+    {
+      "id": "gb-male",
+      "model": "~/.cache/piper-test/voice-gb-male.onnx",
+      "lengthScale": 1.45,
+      "usage": 0,
+      "clients": []
+    },
+    {
+      "id": "us-male",
+      "model": "~/.cache/piper-test/voice-us-male.onnx",
+      "lengthScale": 1.45,
+      "usage": 0,
+      "clients": []
+    }
+  ]
+}
